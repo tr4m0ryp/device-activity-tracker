@@ -105,7 +105,8 @@ check_virtualbox() {
     echo "  2. Open the DMG and run VirtualBox.pkg"
     echo "  3. If blocked, go to System Preferences > Security & Privacy"
     echo "     and click 'Allow' for Oracle"
-    echo "  4. Re-run this script after installation"
+    echo "  4. RESTART YOUR MAC after allowing"
+    echo "  5. Re-run this script after restart"
     echo ""
     
     read -p "Download VirtualBox now? (y/n) " -n 1 -r
@@ -165,9 +166,53 @@ check_docker_toolbox() {
     exit 1
 }
 
+# Setup VirtualBox network with sudo (fixes E_ACCESSDENIED errors)
+setup_virtualbox_network() {
+    print_section "Setting up VirtualBox network (requires sudo)..."
+    
+    echo ""
+    echo "VirtualBox needs elevated permissions to configure networking."
+    echo "You may be prompted for your password."
+    echo ""
+    
+    # Check if host-only network exists
+    if ! VBoxManage list hostonlyifs 2>/dev/null | grep -q "vboxnet0"; then
+        print_warning "Creating VirtualBox host-only network..."
+        sudo /usr/local/bin/VBoxManage hostonlyif create
+    fi
+    
+    # Configure the network
+    print_warning "Configuring VirtualBox host-only network..."
+    sudo /usr/local/bin/VBoxManage hostonlyif ipconfig vboxnet0 --ip 192.168.99.1 --netmask 255.255.255.0 2>/dev/null || true
+    
+    print_success "VirtualBox network configured"
+}
+
+# Fix VirtualBox permissions
+fix_virtualbox_permissions() {
+    print_section "Fixing VirtualBox permissions..."
+    
+    echo ""
+    echo "This will fix VirtualBox kernel extension permissions."
+    echo "You may be prompted for your password."
+    echo ""
+    
+    # Load VirtualBox kernel extensions
+    sudo kextload -b org.virtualbox.kext.VBoxDrv 2>/dev/null || true
+    sudo kextload -b org.virtualbox.kext.VBoxNetFlt 2>/dev/null || true
+    sudo kextload -b org.virtualbox.kext.VBoxNetAdp 2>/dev/null || true
+    sudo kextload -b org.virtualbox.kext.VBoxUSB 2>/dev/null || true
+    
+    print_success "VirtualBox kernel extensions loaded"
+}
+
 # Initialize Docker Machine (the Linux VM that runs Docker)
 init_docker_machine() {
     print_section "Initializing Docker Machine..."
+    
+    # First, ensure VirtualBox permissions are correct
+    fix_virtualbox_permissions
+    setup_virtualbox_network
     
     # Check if default machine exists
     if docker-machine ls 2>/dev/null | grep -q "^default"; then
@@ -175,16 +220,22 @@ init_docker_machine() {
         
         if [[ "$MACHINE_STATUS" == "Running" ]]; then
             print_success "Docker machine 'default' is running"
-        else
+        elif [[ "$MACHINE_STATUS" == "Stopped" ]]; then
             print_warning "Starting Docker machine 'default'..."
-            docker-machine start default
+            docker-machine start default || {
+                print_warning "Failed to start. Trying with network fix..."
+                setup_virtualbox_network
+                docker-machine start default
+            }
             print_success "Docker machine started"
+        else
+            # Machine exists but in error state - recreate it
+            print_warning "Docker machine in error state. Recreating..."
+            docker-machine rm -f default 2>/dev/null || true
+            create_docker_machine
         fi
     else
-        print_warning "Creating Docker machine 'default'..."
-        echo "This will create a Linux VM in VirtualBox (may take a few minutes)..."
-        docker-machine create --driver virtualbox default
-        print_success "Docker machine created"
+        create_docker_machine
     fi
     
     # Set up environment
@@ -196,9 +247,52 @@ init_docker_machine() {
     if docker info &> /dev/null; then
         print_success "Docker is working"
     else
-        print_error "Docker is not responding. Try: docker-machine restart default"
+        print_error "Docker is not responding."
+        echo ""
+        echo "Try these steps:"
+        echo "  1. Go to System Preferences > Security & Privacy"
+        echo "  2. Click 'Allow' for Oracle if you see it"
+        echo "  3. RESTART YOUR MAC"
+        echo "  4. Run this script again"
+        echo ""
+        echo "Or try manually:"
+        echo "  docker-machine restart default"
         exit 1
     fi
+}
+
+# Create Docker Machine with error handling
+create_docker_machine() {
+    print_warning "Creating Docker machine 'default'..."
+    echo "This will create a Linux VM in VirtualBox (may take a few minutes)..."
+    echo ""
+    
+    # Try to create the machine
+    if ! docker-machine create --driver virtualbox default 2>&1; then
+        echo ""
+        print_error "Failed to create Docker machine."
+        echo ""
+        echo -e "${YELLOW}This is usually caused by VirtualBox permission issues.${NC}"
+        echo ""
+        echo "Please try these steps:"
+        echo ""
+        echo "  1. Open System Preferences > Security & Privacy > General"
+        echo "  2. Look for a message about 'Oracle' being blocked"
+        echo "  3. Click 'Allow'"
+        echo "  4. RESTART YOUR MAC (required!)"
+        echo "  5. Run this script again"
+        echo ""
+        
+        read -p "Would you like to open Security & Privacy now? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            open "x-apple.systempreferences:com.apple.preference.security?General"
+        fi
+        
+        exit 1
+    fi
+    
+    print_success "Docker machine created"
 }
 
 # Create Dockerfile for the project
@@ -344,9 +438,10 @@ show_menu() {
     echo "  4) Open web client in browser"
     echo "  5) Check Docker status"
     echo "  6) Stop all containers"
-    echo "  7) Exit"
+    echo "  7) Fix VirtualBox permissions (if having issues)"
+    echo "  8) Exit"
     echo ""
-    read -p "Enter choice [1-7]: " choice
+    read -p "Enter choice [1-8]: " choice
     
     case $choice in
         1)
@@ -371,6 +466,10 @@ show_menu() {
             show_menu
             ;;
         7)
+            fix_all_permissions
+            show_menu
+            ;;
+        8)
             echo "Goodbye!"
             exit 0
             ;;
@@ -379,6 +478,17 @@ show_menu() {
             show_menu
             ;;
     esac
+}
+
+# Fix all permissions (menu option)
+fix_all_permissions() {
+    print_section "Fixing all VirtualBox permissions..."
+    
+    fix_virtualbox_permissions
+    setup_virtualbox_network
+    
+    echo ""
+    print_success "Permissions fixed. Try starting the tracker now."
 }
 
 # Run with Signal support
@@ -419,6 +529,10 @@ check_docker_status() {
     
     echo ""
     echo "Docker Machine IP: $(docker-machine ip default 2>/dev/null || echo 'Not running')"
+    
+    echo ""
+    echo "VirtualBox Host-Only Networks:"
+    VBoxManage list hostonlyifs 2>/dev/null | grep -E "^Name:|^IPAddress:" || echo "None found"
 }
 
 # Stop all containers
