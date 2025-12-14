@@ -4,6 +4,8 @@
 # ================================================================
 # Uses Docker Toolbox to run the project in a Linux container
 # This bypasses the Node.js 20+ macOS compatibility issue
+# 
+# NO HOMEBREW REQUIRED - Direct downloads only
 # ================================================================
 
 set -e
@@ -17,12 +19,21 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Download URLs for direct installation (no Homebrew)
 DOCKER_TOOLBOX_VERSION="19.03.1"
 DOCKER_TOOLBOX_URL="https://github.com/docker-archive/toolbox/releases/download/v${DOCKER_TOOLBOX_VERSION}/DockerToolbox-${DOCKER_TOOLBOX_VERSION}.pkg"
+
+# VirtualBox 6.1.50 - last version that supports High Sierra
+VIRTUALBOX_VERSION="6.1.50"
+VIRTUALBOX_DMG="VirtualBox-${VIRTUALBOX_VERSION}-161033-OSX.dmg"
+VIRTUALBOX_URL="https://download.virtualbox.org/virtualbox/${VIRTUALBOX_VERSION}/${VIRTUALBOX_DMG}"
 
 echo -e "${CYAN}======================================================${NC}"
 echo -e "${CYAN}  Device Activity Tracker - macOS High Sierra Setup   ${NC}"
 echo -e "${CYAN}  Using Docker Toolbox for Node.js 20+ Compatibility  ${NC}"
+echo -e "${CYAN}======================================================${NC}"
+echo -e "${YELLOW}  No Homebrew required - Direct downloads only       ${NC}"
 echo -e "${CYAN}======================================================${NC}\n"
 
 # Function to print section headers
@@ -71,71 +82,87 @@ check_macos() {
     fi
 }
 
-# Check if Homebrew is installed
-check_homebrew() {
-    print_section "Checking Homebrew..."
-    
-    if command -v brew &> /dev/null; then
-        print_success "Homebrew is installed"
-    else
-        print_warning "Homebrew not found. Installing..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        print_success "Homebrew installed"
-    fi
-}
-
-# Check if VirtualBox is installed (required for Docker Toolbox)
+# Check and install VirtualBox (required for Docker Toolbox)
 check_virtualbox() {
     print_section "Checking VirtualBox..."
     
     if command -v VBoxManage &> /dev/null; then
         VB_VERSION=$(VBoxManage --version | cut -d'r' -f1)
         print_success "VirtualBox $VB_VERSION is installed"
-    else
-        print_warning "VirtualBox not found. Installing via Homebrew..."
-        brew install --cask virtualbox
-        print_success "VirtualBox installed"
-        print_warning "You may need to allow VirtualBox in System Preferences > Security & Privacy"
-        echo "Press Enter after allowing VirtualBox in Security & Privacy..."
-        read
+        return 0
     fi
+    
+    print_warning "VirtualBox not found."
+    echo ""
+    echo "VirtualBox is required for Docker Toolbox."
+    echo ""
+    echo "Please download and install VirtualBox ${VIRTUALBOX_VERSION}:"
+    echo ""
+    echo -e "  ${CYAN}${VIRTUALBOX_URL}${NC}"
+    echo ""
+    echo "Installation steps:"
+    echo "  1. Download the DMG file"
+    echo "  2. Open the DMG and run VirtualBox.pkg"
+    echo "  3. If blocked, go to System Preferences > Security & Privacy"
+    echo "     and click 'Allow' for Oracle"
+    echo "  4. Re-run this script after installation"
+    echo ""
+    
+    read -p "Download VirtualBox now? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Downloading VirtualBox..."
+        cd ~/Downloads
+        curl -L -O "$VIRTUALBOX_URL"
+        echo ""
+        print_success "Downloaded to ~/Downloads/${VIRTUALBOX_DMG}"
+        echo ""
+        echo "Opening the DMG file..."
+        open ~/Downloads/${VIRTUALBOX_DMG}
+        echo ""
+        print_warning "Please complete the VirtualBox installation, then run this script again."
+    fi
+    
+    exit 1
 }
 
-# Check if Docker Toolbox / docker-machine is installed
+# Check and install Docker Toolbox
 check_docker_toolbox() {
     print_section "Checking Docker Toolbox..."
     
-    if command -v docker-machine &> /dev/null; then
-        print_success "docker-machine is installed"
-    else
-        print_warning "Docker Toolbox not found."
-        echo ""
-        echo "Docker Toolbox needs to be installed manually:"
-        echo ""
-        echo "  1. Download Docker Toolbox from:"
-        echo -e "     ${CYAN}${DOCKER_TOOLBOX_URL}${NC}"
-        echo ""
-        echo "  2. Open the .pkg file and follow the installer"
-        echo ""
-        echo "  3. Re-run this script after installation"
-        echo ""
-        
-        read -p "Open download page in browser? (y/n) " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            open "https://github.com/docker-archive/toolbox/releases/tag/v${DOCKER_TOOLBOX_VERSION}"
-        fi
-        
-        echo ""
-        print_warning "After installing Docker Toolbox, run this script again."
-        exit 1
+    if command -v docker-machine &> /dev/null && command -v docker &> /dev/null; then
+        print_success "Docker Toolbox is installed"
+        return 0
     fi
     
-    # Check if docker command exists
-    if ! command -v docker &> /dev/null; then
-        print_error "docker command not found. Please reinstall Docker Toolbox."
-        exit 1
+    print_warning "Docker Toolbox not found."
+    echo ""
+    echo "Please download and install Docker Toolbox:"
+    echo ""
+    echo -e "  ${CYAN}${DOCKER_TOOLBOX_URL}${NC}"
+    echo ""
+    echo "Installation steps:"
+    echo "  1. Download the .pkg file"
+    echo "  2. Open and run the installer"
+    echo "  3. Re-run this script after installation"
+    echo ""
+    
+    read -p "Download Docker Toolbox now? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Downloading Docker Toolbox..."
+        cd ~/Downloads
+        curl -L -O "$DOCKER_TOOLBOX_URL"
+        echo ""
+        print_success "Downloaded to ~/Downloads/DockerToolbox-${DOCKER_TOOLBOX_VERSION}.pkg"
+        echo ""
+        echo "Opening the installer..."
+        open ~/Downloads/DockerToolbox-${DOCKER_TOOLBOX_VERSION}.pkg
+        echo ""
+        print_warning "Please complete the Docker Toolbox installation, then run this script again."
     fi
+    
+    exit 1
 }
 
 # Initialize Docker Machine (the Linux VM that runs Docker)
@@ -143,7 +170,7 @@ init_docker_machine() {
     print_section "Initializing Docker Machine..."
     
     # Check if default machine exists
-    if docker-machine ls | grep -q "^default"; then
+    if docker-machine ls 2>/dev/null | grep -q "^default"; then
         MACHINE_STATUS=$(docker-machine status default 2>/dev/null || echo "Unknown")
         
         if [[ "$MACHINE_STATUS" == "Running" ]]; then
@@ -272,6 +299,9 @@ run_tracker() {
     
     cd "$SCRIPT_DIR"
     
+    # Make sure Docker environment is set
+    eval $(docker-machine env default 2>/dev/null) || true
+    
     # Check if container already exists
     if docker ps -a | grep -q "device-activity-tracker"; then
         print_warning "Removing existing container..."
@@ -356,6 +386,7 @@ run_with_signal() {
     print_section "Starting with Signal support..."
     
     cd "$SCRIPT_DIR"
+    eval $(docker-machine env default 2>/dev/null) || true
     docker-compose -f docker-compose.highsierra.yml --profile signal up
 }
 
@@ -376,6 +407,8 @@ open_web_client() {
 check_docker_status() {
     print_section "Docker Status"
     
+    eval $(docker-machine env default 2>/dev/null) || true
+    
     echo ""
     echo "Docker Machine:"
     docker-machine ls
@@ -392,6 +425,7 @@ check_docker_status() {
 stop_containers() {
     print_section "Stopping containers..."
     
+    eval $(docker-machine env default 2>/dev/null) || true
     docker-compose -f docker-compose.highsierra.yml down 2>/dev/null || true
     docker rm -f device-activity-tracker 2>/dev/null || true
     
@@ -401,7 +435,6 @@ stop_containers() {
 # Main script execution
 main() {
     check_macos
-    check_homebrew
     check_virtualbox
     check_docker_toolbox
     init_docker_machine
@@ -416,6 +449,7 @@ main() {
     fi
     
     # Build image if it doesn't exist
+    eval $(docker-machine env default 2>/dev/null) || true
     if ! docker images | grep -q "device-activity-tracker"; then
         build_docker_image
     fi
