@@ -27,7 +27,10 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Configuration
-NODE_VERSION="18"  # Node 18 has better compatibility than 20 for older systems
+# Node.js 16 is the last version with macOS High Sierra (10.13) support
+# Node.js 18+ requires macOS 10.15 (Catalina) or later
+NODE_VERSION_HIGH_SIERRA="16"
+NODE_VERSION_MODERN="18"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo -e "${CYAN}======================================================${NC}"
@@ -137,6 +140,15 @@ install_homebrew() {
 install_nodejs() {
     print_section "Checking Node.js..."
     
+    # Determine which Node version to use based on macOS version
+    if [[ "$IS_HIGH_SIERRA" == true ]]; then
+        NODE_VERSION="$NODE_VERSION_HIGH_SIERRA"
+        print_warning "macOS High Sierra detected - using Node.js $NODE_VERSION"
+        print_warning "Node.js 18+ requires macOS 10.15 (Catalina) or later"
+    else
+        NODE_VERSION="$NODE_VERSION_MODERN"
+    fi
+    
     # Check if nvm is installed
     export NVM_DIR="$HOME/.nvm"
     
@@ -154,34 +166,48 @@ install_nodejs() {
         print_success "nvm installed"
     fi
     
-    # Install Node.js
+    # Check if we need to uninstall incompatible Node version
     if command_exists node; then
-        CURRENT_NODE=$(node --version)
-        echo "Node.js already installed: $CURRENT_NODE"
-        
-        # Check if version is adequate (18+)
-        NODE_MAJOR=$(echo "$CURRENT_NODE" | sed 's/v//' | cut -d. -f1)
-        if [[ "$NODE_MAJOR" -lt 18 ]]; then
-            print_warning "Node.js version too old. Installing Node.js $NODE_VERSION..."
+        # Test if Node actually works
+        if ! node --version &>/dev/null; then
+            print_warning "Current Node.js installation is broken (incompatible with this macOS)"
+            print_warning "Installing compatible Node.js $NODE_VERSION..."
             nvm install $NODE_VERSION
             nvm use $NODE_VERSION
+            nvm alias default $NODE_VERSION
+        else
+            CURRENT_NODE=$(node --version)
+            echo "Node.js already installed: $CURRENT_NODE"
+            
+            NODE_MAJOR=$(echo "$CURRENT_NODE" | sed 's/v//' | cut -d. -f1)
+            
+            # On High Sierra, if Node >= 18, it won't work - need to downgrade
+            if [[ "$IS_HIGH_SIERRA" == true && "$NODE_MAJOR" -ge 18 ]]; then
+                print_warning "Node.js $CURRENT_NODE is not compatible with High Sierra"
+                print_warning "Installing Node.js $NODE_VERSION instead..."
+                nvm install $NODE_VERSION
+                nvm use $NODE_VERSION
+                nvm alias default $NODE_VERSION
+            elif [[ "$NODE_MAJOR" -lt 16 ]]; then
+                print_warning "Node.js version too old. Installing Node.js $NODE_VERSION..."
+                nvm install $NODE_VERSION
+                nvm use $NODE_VERSION
+            fi
         fi
     else
         echo "Installing Node.js $NODE_VERSION..."
         
-        if [[ "$IS_HIGH_SIERRA" == true ]]; then
-            print_warning "On High Sierra, Node.js may need to compile from source"
-            print_warning "This could take 10-20 minutes..."
-        fi
-        
-        # Try to install, may compile from source on old macOS
-        nvm install $NODE_VERSION || {
-            print_error "Failed to install Node.js $NODE_VERSION"
-            print_warning "Trying Node.js 16 as fallback..."
-            nvm install 16
-        }
-        
-        nvm use $NODE_VERSION 2>/dev/null || nvm use 16
+        # Install the appropriate version
+        nvm install $NODE_VERSION
+        nvm use $NODE_VERSION
+        nvm alias default $NODE_VERSION
+    fi
+    
+    # Verify installation works
+    if ! node --version &>/dev/null; then
+        print_error "Node.js installation failed or is incompatible"
+        print_error "Please try manually: nvm install 16 && nvm use 16"
+        exit 1
     fi
     
     echo "Node.js version: $(node --version)"
