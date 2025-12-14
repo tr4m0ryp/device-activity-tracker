@@ -2,19 +2,9 @@
 
 # Device Activity Tracker - macOS High Sierra Setup & Run Script
 # ================================================================
-# This script is designed for macOS High Sierra (10.13)
-# 
-# KNOWN COMPATIBILITY ISSUES:
-# ---------------------------
-# 1. Docker Desktop does NOT support High Sierra (requires 10.15+)
-#    - Signal tracking via Docker will NOT work
-#    - Only WhatsApp tracking (via Baileys) will be available
-#
-# 2. Homebrew may have limited support for High Sierra
-#    - Using older Homebrew version or manual installation as fallback
-#
-# 3. Node.js - Latest versions may not have prebuilt binaries
-#    - Will try to install via nvm with compilation fallback
+# Uses Docker Toolbox to run the project in a Linux container
+# This bypasses the Node.js 20+ macOS compatibility issue
+# ================================================================
 
 set -e
 
@@ -26,15 +16,13 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Configuration
-# Node.js 16 is the last version with macOS High Sierra (10.13) support
-# Node.js 18+ requires macOS 10.15 (Catalina) or later
-NODE_VERSION_HIGH_SIERRA="16"
-NODE_VERSION_MODERN="18"
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DOCKER_TOOLBOX_VERSION="19.03.1"
+DOCKER_TOOLBOX_URL="https://github.com/docker-archive/toolbox/releases/download/v${DOCKER_TOOLBOX_VERSION}/DockerToolbox-${DOCKER_TOOLBOX_VERSION}.pkg"
 
 echo -e "${CYAN}======================================================${NC}"
 echo -e "${CYAN}  Device Activity Tracker - macOS High Sierra Setup   ${NC}"
+echo -e "${CYAN}  Using Docker Toolbox for Node.js 20+ Compatibility  ${NC}"
 echo -e "${CYAN}======================================================${NC}\n"
 
 # Function to print section headers
@@ -42,393 +30,399 @@ print_section() {
     echo -e "\n${BLUE}>>> $1${NC}"
 }
 
-# Function to print warnings
-print_warning() {
-    echo -e "${YELLOW}WARNING: $1${NC}"
-}
-
-# Function to print errors
-print_error() {
-    echo -e "${RED}ERROR: $1${NC}"
-}
-
-# Function to print success
 print_success() {
-    echo -e "${GREEN}SUCCESS: $1${NC}"
+    echo -e "${GREEN}[OK]${NC} $1"
 }
 
-# Function to check if command exists
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
+print_warning() {
+    echo -e "${YELLOW}[!]${NC} $1"
 }
 
-# Detect macOS version
-detect_macos_version() {
-    print_section "Detecting macOS version..."
-    
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check if running on macOS
+check_macos() {
     if [[ "$(uname)" != "Darwin" ]]; then
-        print_error "This script is designed for macOS only!"
+        print_error "This script is for macOS only."
+        print_warning "For Linux, use the './run' script instead."
         exit 1
     fi
     
     MACOS_VERSION=$(sw_vers -productVersion)
+    echo "Detected macOS version: $MACOS_VERSION"
+    
     MACOS_MAJOR=$(echo "$MACOS_VERSION" | cut -d. -f1)
     MACOS_MINOR=$(echo "$MACOS_VERSION" | cut -d. -f2)
     
-    echo "Detected macOS version: $MACOS_VERSION"
-    
-    if [[ "$MACOS_MAJOR" -eq 10 && "$MACOS_MINOR" -le 13 ]]; then
-        print_warning "macOS High Sierra or earlier detected!"
-        print_warning "Some features may have limited compatibility."
-        IS_HIGH_SIERRA=true
-    else
-        IS_HIGH_SIERRA=false
+    # If running Catalina or later, suggest using regular run script
+    if [[ "$MACOS_MAJOR" -ge 11 ]] || [[ "$MACOS_MAJOR" -eq 10 && "$MACOS_MINOR" -ge 15 ]]; then
+        echo ""
+        print_success "Your macOS version ($MACOS_VERSION) supports Node.js 20+ natively!"
+        print_warning "You can use the simpler './run' script instead."
+        echo ""
+        read -p "Continue with Docker anyway? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Use './run' for native setup."
+            exit 0
+        fi
     fi
 }
 
-# Install Xcode Command Line Tools
-install_xcode_tools() {
-    print_section "Checking Xcode Command Line Tools..."
-    
-    if xcode-select -p &>/dev/null; then
-        echo "Xcode Command Line Tools already installed"
-    else
-        echo "Installing Xcode Command Line Tools..."
-        echo "A dialog may appear - please click 'Install' and wait for completion"
-        xcode-select --install
-        
-        # Wait for installation
-        echo "Waiting for Xcode Command Line Tools installation..."
-        until xcode-select -p &>/dev/null; do
-            sleep 5
-        done
-        print_success "Xcode Command Line Tools installed"
-    fi
-}
-
-# Install Homebrew
-install_homebrew() {
+# Check if Homebrew is installed
+check_homebrew() {
     print_section "Checking Homebrew..."
     
-    if command_exists brew; then
-        echo "Homebrew already installed: $(brew --version | head -n1)"
-        
-        # Update Homebrew
-        echo "Updating Homebrew..."
-        brew update || print_warning "Homebrew update failed, continuing anyway..."
+    if command -v brew &> /dev/null; then
+        print_success "Homebrew is installed"
     else
-        echo "Installing Homebrew..."
-        
-        if [[ "$IS_HIGH_SIERRA" == true ]]; then
-            print_warning "Installing Homebrew on High Sierra may require older version"
-        fi
-        
+        print_warning "Homebrew not found. Installing..."
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        
-        # Add Homebrew to PATH for this session
-        if [[ -f /opt/homebrew/bin/brew ]]; then
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-        elif [[ -f /usr/local/bin/brew ]]; then
-            eval "$(/usr/local/bin/brew shellenv)"
-        fi
-        
         print_success "Homebrew installed"
     fi
 }
 
-# Install Node.js via nvm (better compatibility for older macOS)
-install_nodejs() {
-    print_section "Checking Node.js..."
+# Check if VirtualBox is installed (required for Docker Toolbox)
+check_virtualbox() {
+    print_section "Checking VirtualBox..."
     
-    # Determine which Node version to use based on macOS version
-    if [[ "$IS_HIGH_SIERRA" == true ]]; then
-        NODE_VERSION="$NODE_VERSION_HIGH_SIERRA"
-        print_warning "macOS High Sierra detected - using Node.js $NODE_VERSION"
-        print_warning "Node.js 18+ requires macOS 10.15 (Catalina) or later"
+    if command -v VBoxManage &> /dev/null; then
+        VB_VERSION=$(VBoxManage --version | cut -d'r' -f1)
+        print_success "VirtualBox $VB_VERSION is installed"
     else
-        NODE_VERSION="$NODE_VERSION_MODERN"
+        print_warning "VirtualBox not found. Installing via Homebrew..."
+        brew install --cask virtualbox
+        print_success "VirtualBox installed"
+        print_warning "You may need to allow VirtualBox in System Preferences > Security & Privacy"
+        echo "Press Enter after allowing VirtualBox in Security & Privacy..."
+        read
     fi
+}
+
+# Check if Docker Toolbox / docker-machine is installed
+check_docker_toolbox() {
+    print_section "Checking Docker Toolbox..."
     
-    # Check if nvm is installed
-    export NVM_DIR="$HOME/.nvm"
-    
-    if [[ -s "$NVM_DIR/nvm.sh" ]]; then
-        source "$NVM_DIR/nvm.sh"
-        echo "nvm already installed"
+    if command -v docker-machine &> /dev/null; then
+        print_success "docker-machine is installed"
     else
-        echo "Installing nvm (Node Version Manager)..."
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+        print_warning "Docker Toolbox not found."
+        echo ""
+        echo "Docker Toolbox needs to be installed manually:"
+        echo ""
+        echo "  1. Download Docker Toolbox from:"
+        echo -e "     ${CYAN}${DOCKER_TOOLBOX_URL}${NC}"
+        echo ""
+        echo "  2. Open the .pkg file and follow the installer"
+        echo ""
+        echo "  3. Re-run this script after installation"
+        echo ""
         
-        # Load nvm
-        export NVM_DIR="$HOME/.nvm"
-        source "$NVM_DIR/nvm.sh"
-        
-        print_success "nvm installed"
-    fi
-    
-    # Check if we need to uninstall incompatible Node version
-    if command_exists node; then
-        # Test if Node actually works
-        if ! node --version &>/dev/null; then
-            print_warning "Current Node.js installation is broken (incompatible with this macOS)"
-            print_warning "Installing compatible Node.js $NODE_VERSION..."
-            nvm install $NODE_VERSION
-            nvm use $NODE_VERSION
-            nvm alias default $NODE_VERSION
-        else
-            CURRENT_NODE=$(node --version)
-            echo "Node.js already installed: $CURRENT_NODE"
-            
-            NODE_MAJOR=$(echo "$CURRENT_NODE" | sed 's/v//' | cut -d. -f1)
-            
-            # On High Sierra, if Node >= 18, it won't work - need to downgrade
-            if [[ "$IS_HIGH_SIERRA" == true && "$NODE_MAJOR" -ge 18 ]]; then
-                print_warning "Node.js $CURRENT_NODE is not compatible with High Sierra"
-                print_warning "Installing Node.js $NODE_VERSION instead..."
-                nvm install $NODE_VERSION
-                nvm use $NODE_VERSION
-                nvm alias default $NODE_VERSION
-            elif [[ "$NODE_MAJOR" -lt 16 ]]; then
-                print_warning "Node.js version too old. Installing Node.js $NODE_VERSION..."
-                nvm install $NODE_VERSION
-                nvm use $NODE_VERSION
-            fi
+        read -p "Open download page in browser? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            open "https://github.com/docker-archive/toolbox/releases/tag/v${DOCKER_TOOLBOX_VERSION}"
         fi
-    else
-        echo "Installing Node.js $NODE_VERSION..."
         
-        # Install the appropriate version
-        nvm install $NODE_VERSION
-        nvm use $NODE_VERSION
-        nvm alias default $NODE_VERSION
-    fi
-    
-    # Verify installation works
-    if ! node --version &>/dev/null; then
-        print_error "Node.js installation failed or is incompatible"
-        print_error "Please try manually: nvm install 16 && nvm use 16"
+        echo ""
+        print_warning "After installing Docker Toolbox, run this script again."
         exit 1
     fi
     
-    echo "Node.js version: $(node --version)"
-    echo "npm version: $(npm --version)"
-    print_success "Node.js ready"
-}
-
-# Install Git
-install_git() {
-    print_section "Checking Git..."
-    
-    if command_exists git; then
-        echo "Git already installed: $(git --version)"
-    else
-        echo "Installing Git via Homebrew..."
-        brew install git
-        print_success "Git installed"
-    fi
-}
-
-# Docker warning for High Sierra
-docker_warning() {
-    print_section "Docker Compatibility Check..."
-    
-    if [[ "$IS_HIGH_SIERRA" == true ]]; then
-        echo ""
-        print_warning "=============================================="
-        print_warning "Docker Desktop is NOT compatible with High Sierra!"
-        print_warning "Docker requires macOS 10.15 (Catalina) or later."
-        print_warning "=============================================="
-        echo ""
-        print_warning "This means Signal tracking will NOT work."
-        print_warning "Only WhatsApp tracking (via Baileys) is available."
-        echo ""
-        read -p "Press Enter to continue with WhatsApp-only mode..."
-        DOCKER_AVAILABLE=false
-    else
-        if command_exists docker; then
-            echo "Docker is available"
-            DOCKER_AVAILABLE=true
-        else
-            print_warning "Docker not installed. Signal tracking won't be available."
-            DOCKER_AVAILABLE=false
-        fi
-    fi
-}
-
-# Install project dependencies
-install_dependencies() {
-    print_section "Installing project dependencies..."
-    
-    cd "$PROJECT_DIR"
-    
-    # Check if package.json exists
-    if [[ ! -f "package.json" ]]; then
-        print_error "package.json not found in $PROJECT_DIR"
+    # Check if docker command exists
+    if ! command -v docker &> /dev/null; then
+        print_error "docker command not found. Please reinstall Docker Toolbox."
         exit 1
     fi
-    
-    # Install root dependencies
-    echo "Installing backend dependencies..."
-    npm install
-    
-    # Install client dependencies
-    if [[ -d "client" && -f "client/package.json" ]]; then
-        echo "Installing frontend dependencies..."
-        cd client
-        npm install
-        cd ..
-    fi
-    
-    print_success "Dependencies installed"
 }
 
-# Build the project
-build_project() {
-    print_section "Building project..."
+# Initialize Docker Machine (the Linux VM that runs Docker)
+init_docker_machine() {
+    print_section "Initializing Docker Machine..."
     
-    cd "$PROJECT_DIR"
-    
-    # Compile TypeScript if tsconfig exists
-    if [[ -f "tsconfig.json" ]]; then
-        echo "Compiling TypeScript..."
-        npm run build 2>/dev/null || npx tsc 2>/dev/null || echo "TypeScript compilation skipped"
+    # Check if default machine exists
+    if docker-machine ls | grep -q "^default"; then
+        MACHINE_STATUS=$(docker-machine status default 2>/dev/null || echo "Unknown")
+        
+        if [[ "$MACHINE_STATUS" == "Running" ]]; then
+            print_success "Docker machine 'default' is running"
+        else
+            print_warning "Starting Docker machine 'default'..."
+            docker-machine start default
+            print_success "Docker machine started"
+        fi
+    else
+        print_warning "Creating Docker machine 'default'..."
+        echo "This will create a Linux VM in VirtualBox (may take a few minutes)..."
+        docker-machine create --driver virtualbox default
+        print_success "Docker machine created"
     fi
     
-    print_success "Build complete"
+    # Set up environment
+    print_section "Setting up Docker environment..."
+    eval $(docker-machine env default)
+    print_success "Docker environment configured"
+    
+    # Verify Docker is working
+    if docker info &> /dev/null; then
+        print_success "Docker is working"
+    else
+        print_error "Docker is not responding. Try: docker-machine restart default"
+        exit 1
+    fi
 }
 
-# Run the application
-run_application() {
-    print_section "Starting Application..."
+# Create Dockerfile for the project
+create_dockerfile() {
+    print_section "Creating Dockerfile..."
     
-    cd "$PROJECT_DIR"
-    
-    echo ""
-    echo -e "${GREEN}======================================${NC}"
-    echo -e "${GREEN}   Starting Device Activity Tracker   ${NC}"
-    echo -e "${GREEN}======================================${NC}"
-    echo ""
-    
-    if [[ "$DOCKER_AVAILABLE" == false ]]; then
-        echo -e "${YELLOW}Running in WhatsApp-only mode (no Signal support)${NC}"
-        echo ""
-    fi
-    
-    # Function to cleanup on exit
-    cleanup() {
-        echo -e "\n${YELLOW}Shutting down servers...${NC}"
-        kill 0 2>/dev/null
-    }
-    
-    trap cleanup EXIT INT TERM
-    
-    # Start backend server
-    echo -e "${GREEN}Starting backend server...${NC}"
-    npx tsx src/server.ts &
-    BACKEND_PID=$!
-    
-    # Wait for backend to start
-    sleep 3
-    
-    # Start frontend
-    if [[ -d "client" ]]; then
-        echo -e "${GREEN}Starting frontend server...${NC}"
-        cd client
-        npm start &
-        FRONTEND_PID=$!
-        cd ..
-    fi
-    
-    echo ""
-    echo -e "${GREEN}======================================${NC}"
-    echo -e "${GREEN}         Servers are running          ${NC}"
-    echo -e "${GREEN}======================================${NC}"
-    echo ""
-    echo -e "${BLUE}Backend:${NC}  http://localhost:3001"
-    echo -e "${BLUE}Frontend:${NC} http://localhost:3000"
-    echo ""
-    echo -e "${YELLOW}Press Ctrl+C to stop all servers${NC}"
-    echo ""
-    
-    # Wait for all processes
-    wait
+    cat > "$SCRIPT_DIR/Dockerfile.highsierra" << 'DOCKERFILE'
+# Device Activity Tracker - Docker Container
+# For running on macOS High Sierra via Docker Toolbox
+
+FROM node:20-alpine
+
+# Install dependencies for native modules
+RUN apk add --no-cache \
+    python3 \
+    make \
+    g++ \
+    git \
+    bash
+
+# Create app directory
+WORKDIR /app
+
+# Copy package files first for better caching
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy the rest of the application
+COPY . .
+
+# Build TypeScript
+RUN npm run build
+
+# Expose port for the web client
+EXPOSE 3000
+
+# Default command - can be overridden
+CMD ["npm", "start"]
+DOCKERFILE
+
+    print_success "Dockerfile created at Dockerfile.highsierra"
 }
 
-# Main setup and run function
+# Create docker-compose file
+create_docker_compose() {
+    print_section "Creating docker-compose configuration..."
+    
+    cat > "$SCRIPT_DIR/docker-compose.highsierra.yml" << 'DOCKERCOMPOSE'
+version: '3.8'
+
+services:
+  tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile.highsierra
+    container_name: device-activity-tracker
+    volumes:
+      # Persist authentication data
+      - ./auth_info_baileys:/app/auth_info_baileys
+      # Persist Signal data if used
+      - ./signal-data:/app/signal-data
+    ports:
+      - "3000:3000"
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+  # Optional: Signal tracker with signald
+  signald:
+    image: signald/signald:latest
+    container_name: signald
+    volumes:
+      - ./signald-data:/signald
+    restart: unless-stopped
+    profiles:
+      - signal
+DOCKERCOMPOSE
+
+    print_success "docker-compose.highsierra.yml created"
+}
+
+# Build the Docker image
+build_docker_image() {
+    print_section "Building Docker image..."
+    echo "This may take a few minutes on first run..."
+    
+    cd "$SCRIPT_DIR"
+    docker build -f Dockerfile.highsierra -t device-activity-tracker:latest .
+    
+    print_success "Docker image built successfully"
+}
+
+# Run the tracker
+run_tracker() {
+    print_section "Starting Device Activity Tracker..."
+    
+    cd "$SCRIPT_DIR"
+    
+    # Check if container already exists
+    if docker ps -a | grep -q "device-activity-tracker"; then
+        print_warning "Removing existing container..."
+        docker rm -f device-activity-tracker 2>/dev/null || true
+    fi
+    
+    echo ""
+    echo -e "${GREEN}======================================================${NC}"
+    echo -e "${GREEN}  Device Activity Tracker is starting!                ${NC}"
+    echo -e "${GREEN}======================================================${NC}"
+    echo ""
+    echo "The tracker will run interactively in this terminal."
+    echo "You'll see a QR code to scan with WhatsApp."
+    echo ""
+    echo -e "${YELLOW}Press Ctrl+C to stop the tracker.${NC}"
+    echo ""
+    
+    # Get Docker machine IP for display
+    DOCKER_IP=$(docker-machine ip default 2>/dev/null || echo "localhost")
+    echo -e "${CYAN}Web interface will be at: http://${DOCKER_IP}:3000${NC}"
+    echo ""
+    
+    # Run interactively with TTY
+    docker run -it --rm \
+        --name device-activity-tracker \
+        -v "$SCRIPT_DIR/auth_info_baileys:/app/auth_info_baileys" \
+        -p 3000:3000 \
+        device-activity-tracker:latest \
+        npm start
+}
+
+# Show menu
+show_menu() {
+    echo ""
+    echo -e "${CYAN}What would you like to do?${NC}"
+    echo ""
+    echo "  1) Start WhatsApp Tracker"
+    echo "  2) Start WhatsApp Tracker with Signal support"
+    echo "  3) Rebuild Docker image (after code changes)"
+    echo "  4) Open web client in browser"
+    echo "  5) Check Docker status"
+    echo "  6) Stop all containers"
+    echo "  7) Exit"
+    echo ""
+    read -p "Enter choice [1-7]: " choice
+    
+    case $choice in
+        1)
+            run_tracker
+            ;;
+        2)
+            run_with_signal
+            ;;
+        3)
+            build_docker_image
+            show_menu
+            ;;
+        4)
+            open_web_client
+            ;;
+        5)
+            check_docker_status
+            show_menu
+            ;;
+        6)
+            stop_containers
+            show_menu
+            ;;
+        7)
+            echo "Goodbye!"
+            exit 0
+            ;;
+        *)
+            print_error "Invalid choice"
+            show_menu
+            ;;
+    esac
+}
+
+# Run with Signal support
+run_with_signal() {
+    print_section "Starting with Signal support..."
+    
+    cd "$SCRIPT_DIR"
+    docker-compose -f docker-compose.highsierra.yml --profile signal up
+}
+
+# Open web client
+open_web_client() {
+    # Get Docker machine IP
+    DOCKER_IP=$(docker-machine ip default 2>/dev/null || echo "localhost")
+    
+    echo ""
+    echo -e "${CYAN}Opening web client...${NC}"
+    echo "URL: http://${DOCKER_IP}:3000"
+    echo ""
+    
+    open "http://${DOCKER_IP}:3000"
+}
+
+# Check Docker status
+check_docker_status() {
+    print_section "Docker Status"
+    
+    echo ""
+    echo "Docker Machine:"
+    docker-machine ls
+    
+    echo ""
+    echo "Running Containers:"
+    docker ps
+    
+    echo ""
+    echo "Docker Machine IP: $(docker-machine ip default 2>/dev/null || echo 'Not running')"
+}
+
+# Stop all containers
+stop_containers() {
+    print_section "Stopping containers..."
+    
+    docker-compose -f docker-compose.highsierra.yml down 2>/dev/null || true
+    docker rm -f device-activity-tracker 2>/dev/null || true
+    
+    print_success "All containers stopped"
+}
+
+# Main script execution
 main() {
-    echo "Starting setup at $(date)"
-    echo ""
+    check_macos
+    check_homebrew
+    check_virtualbox
+    check_docker_toolbox
+    init_docker_machine
     
-    # Check if this is just a run (dependencies already installed)
-    if [[ "$1" == "--run-only" ]] || [[ "$1" == "-r" ]]; then
-        print_section "Running application (skip setup)..."
-        
-        # Load nvm
-        export NVM_DIR="$HOME/.nvm"
-        [[ -s "$NVM_DIR/nvm.sh" ]] && source "$NVM_DIR/nvm.sh"
-        
-        detect_macos_version
-        docker_warning
-        run_application
-        exit 0
+    # Create Docker files if they don't exist
+    if [[ ! -f "$SCRIPT_DIR/Dockerfile.highsierra" ]]; then
+        create_dockerfile
     fi
     
-    # Full setup
-    detect_macos_version
-    install_xcode_tools
-    install_homebrew
-    install_nodejs
-    install_git
-    docker_warning
-    install_dependencies
-    build_project
-    
-    echo ""
-    print_success "Setup complete!"
-    echo ""
-    echo "To run the application in the future, use:"
-    echo "  ./run-macos-high-sierra --run-only"
-    echo ""
-    
-    read -p "Would you like to start the application now? (y/n) " -n 1 -r
-    echo
-    
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        run_application
-    else
-        echo "Setup complete. Run './run-macos-high-sierra --run-only' to start."
+    if [[ ! -f "$SCRIPT_DIR/docker-compose.highsierra.yml" ]]; then
+        create_docker_compose
     fi
+    
+    # Build image if it doesn't exist
+    if ! docker images | grep -q "device-activity-tracker"; then
+        build_docker_image
+    fi
+    
+    # Show menu
+    show_menu
 }
 
-# Display help
-show_help() {
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  --run-only, -r    Skip setup and run the application directly"
-    echo "  --help, -h        Show this help message"
-    echo ""
-    echo "First run: $0"
-    echo "  - Installs all dependencies (Xcode tools, Homebrew, Node.js)"
-    echo "  - Sets up the project"
-    echo "  - Optionally starts the application"
-    echo ""
-    echo "Subsequent runs: $0 --run-only"
-    echo "  - Starts the application without reinstalling dependencies"
-    echo ""
-    echo "NOTES for macOS High Sierra:"
-    echo "  - Docker is NOT supported (requires macOS 10.15+)"
-    echo "  - Signal tracking will NOT work"
-    echo "  - Only WhatsApp tracking is available"
-}
-
-# Parse arguments
-case "$1" in
-    --help|-h)
-        show_help
-        exit 0
-        ;;
-    *)
-        main "$@"
-        ;;
-esac
+# Run main
+main
