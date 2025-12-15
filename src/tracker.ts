@@ -54,14 +54,33 @@ interface StateThresholds {
 }
 
 /**
- * Calibration state tracking
+ * RTT Cluster representing a device state
+ */
+interface RTTCluster {
+    centroid: number;              // Cluster center (mean RTT)
+    samples: number[];             // Sample RTTs in this cluster
+    variance: number;              // Cluster variance
+    confidence: number;            // Confidence score (0-1)
+}
+
+/**
+ * Enhanced calibration state tracking with adaptive learning
  */
 interface CalibrationState {
     samplesCollected: number;
-    requiredSamples: number;       // 300 minimum
-    networkBaseline: number;        // Median of first 100 samples
+    requiredSamples: number;       // 500 minimum (increased for better accuracy)
+    networkBaseline: number;        // Robust baseline using trimmed mean
+    networkVariance: number;        // Network variance for confidence scoring
     isCalibrated: boolean;
     calibrationStartedAt: number;
+    calibrationPhase: 'initial' | 'clustering' | 'refinement' | 'adaptive';
+    // Clustering data
+    clusters: Map<string, RTTCluster>;  // Automatically detected state clusters
+    clusteringComplete: boolean;
+    // Adaptive recalibration
+    lastRecalibration: number;
+    recalibrationInterval: number;      // Recalibrate every N samples
+    adaptiveWindow: number[];           // Rolling window for adaptive baseline (last 200 samples)
 }
 
 /**
@@ -200,6 +219,7 @@ export class WhatsAppTracker {
     private globalRttHistory: number[] = []; // For threshold calculation
     private probeStartTimes: Map<string, number> = new Map();
     private probeTimeouts: Map<string, NodeJS.Timeout> = new Map();
+    private probeTargets: Map<string, string> = new Map(); // Map message ID -> target JID
     private lastPresence: string | null = null;
     private probeMethod: ProbeMethod = 'delete'; // Default to delete method
     private aggressiveMode: boolean = false; // New: Aggressive mode flag
@@ -224,7 +244,7 @@ export class WhatsAppTracker {
 
     public setAggressiveMode(enabled: boolean) {
         this.aggressiveMode = enabled;
-        trackerLogger.info(`\nAggressive mode ${enabled ? 'enabled' : 'disabled'} - Probe rate increased\n`);
+        trackerLogger.info(`\nAggressive mode ${enabled ? 'enabled' : 'disabled'} - Probe rate ${enabled ? 'increased' : 'decreased'}\n`);
     }
 
     public setProbeInterval(intervalMs: number) {
@@ -244,7 +264,7 @@ export class WhatsAppTracker {
         if (this.customProbeInterval) {
             trackerLogger.info(`Custom probe interval: ${this.customProbeInterval}ms`);
         } else {
-            trackerLogger.info(`Aggressive mode: ${this.aggressiveMode ? 'Enabled (0.5s probes)' : 'Disabled (2s probes)'}`);
+            trackerLogger.info(`Aggressive mode: ${this.aggressiveMode ? 'Enabled (2s probes)' : 'Disabled (5s probes)'}`);
         }
         trackerLogger.info('');
 
@@ -322,16 +342,28 @@ export class WhatsAppTracker {
                 logger.error(err, 'Error sending probe');
             }
             
-            // Adaptive rate: Slow down if device is OFFLINE
-            let baseDelay = this.customProbeInterval ?? (this.aggressiveMode ? 500 : 2000);
-            const metrics = this.deviceMetrics.get(this.targetJid);
-            if (metrics && metrics.state === 'OFFLINE') {
-                if (this.customProbeInterval) {
-                    baseDelay = Math.max(this.customProbeInterval, 1000); // Minimum 1s offline
-                } else {
-                    baseDelay = this.aggressiveMode ? 2000 : 10000;
+            // Adaptive rate: Slow down only if ALL devices are OFFLINE
+            let baseDelay = this.customProbeInterval ?? (this.aggressiveMode ? 2000 : 5000);
+
+            // Check if any device is still online
+            let anyDeviceOnline = false;
+            for (const [jid, metrics] of this.deviceMetrics.entries()) {
+                if (metrics.state !== 'OFFLINE' && metrics.state !== DeviceState.OFFLINE) {
+                    anyDeviceOnline = true;
+                    break;
                 }
-                trackerLogger.debug(`[ADAPTIVE] Device OFFLINE, slowing probe rate to ${baseDelay}ms`);
+            }
+
+            // Only slow down if all tracked devices are offline
+            if (!anyDeviceOnline && this.deviceMetrics.size > 0) {
+                if (this.customProbeInterval) {
+                    baseDelay = Math.max(this.customProbeInterval, 5000); // Minimum 5s offline
+                } else {
+                    baseDelay = this.aggressiveMode ? 10000 : 30000;
+                }
+                trackerLogger.debug(`[ADAPTIVE] All devices OFFLINE, slowing probe rate to ${baseDelay}ms`);
+            } else if (anyDeviceOnline) {
+                trackerLogger.debug(`[ADAPTIVE] At least one device online, maintaining normal probe rate`);
             }
 
             const delay = Math.floor(Math.random() * 100) + baseDelay;
@@ -377,18 +409,21 @@ export class WhatsAppTracker {
             if (result?.key?.id) {
                 trackerLogger.debug(`[PROBE-DELETE] Delete probe sent successfully, message ID: ${result.key.id}`);
                 this.probeStartTimes.set(result.key.id, startTime);
+                this.probeTargets.set(result.key.id, this.targetJid); // Store target JID
 
                 // Set timeout: if no CLIENT ACK within 10 seconds, mark device as OFFLINE
                 const timeoutId = setTimeout(() => {
                     if (this.probeStartTimes.has(result.key.id!)) {
                         const elapsedTime = Date.now() - startTime;
+                        const targetJid = this.probeTargets.get(result.key.id!) || result.key.remoteJid;
                         trackerLogger.debug(`[PROBE-DELETE TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms - Device is OFFLINE`);
                         this.probeStartTimes.delete(result.key.id!);
                         this.probeTimeouts.delete(result.key.id!);
+                        this.probeTargets.delete(result.key.id!);
 
                         // Mark device as OFFLINE due to no response
-                        if (result.key.remoteJid) {
-                            this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                        if (targetJid) {
+                            this.markDeviceOffline(targetJid, elapsedTime);
                         }
                     }
                 }, 10000); // 10 seconds timeout
@@ -436,18 +471,21 @@ export class WhatsAppTracker {
             if (result?.key?.id) {
                 trackerLogger.debug(`[PROBE-REACTION] Probe sent successfully, message ID: ${result.key.id}`);
                 this.probeStartTimes.set(result.key.id, startTime);
+                this.probeTargets.set(result.key.id, this.targetJid); // Store target JID
 
                 // Set timeout: if no CLIENT ACK within 10 seconds, mark device as OFFLINE
                 const timeoutId = setTimeout(() => {
                     if (this.probeStartTimes.has(result.key.id!)) {
                         const elapsedTime = Date.now() - startTime;
+                        const targetJid = this.probeTargets.get(result.key.id!) || result.key.remoteJid;
                         trackerLogger.debug(`[PROBE-REACTION TIMEOUT] No CLIENT ACK for ${result.key.id} after ${elapsedTime}ms - Device is OFFLINE`);
                         this.probeStartTimes.delete(result.key.id!);
                         this.probeTimeouts.delete(result.key.id!);
+                        this.probeTargets.delete(result.key.id!);
 
                         // Mark device as OFFLINE due to no response
-                        if (result.key.remoteJid) {
-                            this.markDeviceOffline(result.key.remoteJid, elapsedTime);
+                        if (targetJid) {
+                            this.markDeviceOffline(targetJid, elapsedTime);
                         }
                     }
                 }, 10000); // 10 seconds timeout
@@ -520,7 +558,18 @@ export class WhatsAppTracker {
 
         if (startTime) {
             const rtt = Date.now() - startTime;
-            trackerLogger.debug(`[TRACKING] ${type.toUpperCase()} received for ${msgId} from ${fromJid}, RTT: ${rtt}ms`);
+
+            // Get the original target JID this probe was sent to
+            const targetJid = this.probeTargets.get(msgId);
+
+            if (targetJid && fromJid !== targetJid) {
+                // ACK came from a different JID (likely an LID) - learn the mapping
+                trackerLogger.debug(`[LID MAPPING] Auto-learned: ${fromJid} -> ${targetJid}`);
+                this.lidMap.set(fromJid, targetJid);
+                trackerLogger.debug(`[TRACKING] ${type.toUpperCase()} received for ${msgId} from ${fromJid} (LID), crediting to ${targetJid}, RTT: ${rtt}ms`);
+            } else {
+                trackerLogger.debug(`[TRACKING] ${type.toUpperCase()} received for ${msgId} from ${fromJid}, RTT: ${rtt}ms`);
+            }
 
             // Clear timeout
             const timeoutId = this.probeTimeouts.get(msgId);
@@ -530,7 +579,10 @@ export class WhatsAppTracker {
             }
 
             this.probeStartTimes.delete(msgId);
-            this.addMeasurementForDevice(fromJid, rtt);
+            this.probeTargets.delete(msgId);
+
+            // Credit the RTT to the original target JID, not the LID that responded
+            this.addMeasurementForDevice(targetJid || fromJid, rtt);
         }
     }
 
@@ -668,25 +720,104 @@ export class WhatsAppTracker {
                     metrics.rttHistory.shift();
                 }
 
-                // 4. Update calibration state
+                // 4. Update calibration state with multi-phase approach
                 metrics.calibration.samplesCollected = metrics.rttHistory.length;
 
-                // Calculate network baseline after 100 samples
-                if (metrics.calibration.samplesCollected === 100) {
-                    metrics.calibration.networkBaseline = this.calculateNetworkBaseline(metrics.rttHistory);
-                    this.updateAdjustedThresholds(metrics.thresholds, metrics.calibration.networkBaseline);
-                    trackerLogger.debug(
-                        `[CALIBRATION] ${jid}: Network baseline calculated: ${metrics.calibration.networkBaseline.toFixed(0)}ms`
+                // PHASE 1: Initial baseline estimation (50 samples)
+                if (metrics.calibration.samplesCollected === 50 &&
+                    metrics.calibration.calibrationPhase === 'initial') {
+
+                    metrics.calibration.networkBaseline = this.calculateRobustBaseline(metrics.rttHistory);
+                    metrics.calibration.networkVariance = this.calculateVariance(
+                        metrics.rttHistory,
+                        metrics.calibration.networkBaseline
+                    );
+                    metrics.calibration.calibrationPhase = 'clustering';
+
+                    trackerLogger.info(
+                        `\n[PHASE 1 COMPLETE] ${jid}: Initial baseline: ${metrics.calibration.networkBaseline.toFixed(0)}ms, ` +
+                        `StdDev: ${Math.sqrt(metrics.calibration.networkVariance).toFixed(0)}ms\n`
                     );
                 }
 
-                // Mark as calibrated after 300 samples
-                if (metrics.calibration.samplesCollected >= metrics.calibration.requiredSamples && !metrics.calibration.isCalibrated) {
-                    metrics.calibration.isCalibrated = true;
-                    trackerLogger.info(
-                        `\nDevice ${jid} calibration complete (${metrics.calibration.samplesCollected} samples, ` +
-                        `baseline: ${metrics.calibration.networkBaseline.toFixed(0)}ms)\n`
+                // PHASE 2: Cluster detection (200 samples)
+                if (metrics.calibration.samplesCollected === 200 &&
+                    metrics.calibration.calibrationPhase === 'clustering') {
+
+                    // Perform k-means clustering to detect device states
+                    const clusters = this.performKMeansClustering(metrics.rttHistory, 4);
+
+                    // Store clusters
+                    metrics.calibration.clusters.clear();
+                    clusters.forEach((cluster, index) => {
+                        const stateName = ['veryActive', 'minimized', 'screenOn', 'screenOff'][index] || `cluster${index}`;
+                        metrics.calibration.clusters.set(stateName, cluster);
+                    });
+
+                    metrics.calibration.clusteringComplete = true;
+                    metrics.calibration.calibrationPhase = 'refinement';
+
+                    // Update thresholds based on detected clusters
+                    this.updateAdaptiveThresholds(
+                        metrics.thresholds,
+                        clusters,
+                        metrics.calibration.networkBaseline
                     );
+
+                    trackerLogger.info(
+                        `\n[PHASE 2 COMPLETE] ${jid}: Detected ${clusters.length} RTT clusters\n` +
+                        clusters.map((c, i) =>
+                            `  Cluster ${i}: ${c.centroid.toFixed(0)}ms ± ${Math.sqrt(c.variance).toFixed(0)}ms ` +
+                            `(${c.samples.length} samples, confidence: ${(c.confidence * 100).toFixed(0)}%)`
+                        ).join('\n') + '\n'
+                    );
+                }
+
+                // PHASE 3: Refinement (500 samples) - Mark as fully calibrated
+                if (metrics.calibration.samplesCollected >= metrics.calibration.requiredSamples &&
+                    !metrics.calibration.isCalibrated) {
+
+                    // Final baseline recalculation with all data
+                    metrics.calibration.networkBaseline = this.calculateRobustBaseline(metrics.rttHistory);
+                    metrics.calibration.networkVariance = this.calculateVariance(
+                        metrics.rttHistory,
+                        metrics.calibration.networkBaseline
+                    );
+
+                    // Final clustering
+                    const finalClusters = this.performKMeansClustering(metrics.rttHistory, 4);
+                    metrics.calibration.clusters.clear();
+                    finalClusters.forEach((cluster, index) => {
+                        const stateName = ['veryActive', 'minimized', 'screenOn', 'screenOff'][index] || `cluster${index}`;
+                        metrics.calibration.clusters.set(stateName, cluster);
+                    });
+
+                    // Update thresholds with final clusters
+                    this.updateAdaptiveThresholds(
+                        metrics.thresholds,
+                        finalClusters,
+                        metrics.calibration.networkBaseline
+                    );
+
+                    metrics.calibration.isCalibrated = true;
+                    metrics.calibration.calibrationPhase = 'adaptive';
+                    metrics.calibration.lastRecalibration = metrics.calibration.samplesCollected;
+
+                    trackerLogger.info(
+                        `\n[PHASE 3 COMPLETE] ${jid}: Full calibration complete!\n` +
+                        `  Samples: ${metrics.calibration.samplesCollected}\n` +
+                        `  Baseline: ${metrics.calibration.networkBaseline.toFixed(0)}ms\n` +
+                        `  StdDev: ${Math.sqrt(metrics.calibration.networkVariance).toFixed(0)}ms\n` +
+                        `  Clusters: ${finalClusters.length}\n` +
+                        `  Entering adaptive mode (recalibrates every ${metrics.calibration.recalibrationInterval} samples)\n`
+                    );
+                }
+
+                // PHASE 4: Adaptive mode - Continuous recalibration
+                if (metrics.calibration.isCalibrated &&
+                    metrics.calibration.calibrationPhase === 'adaptive') {
+
+                    this.performAdaptiveRecalibration(metrics);
                 }
 
                 // 5. Update temporal pattern
@@ -739,15 +870,22 @@ export class WhatsAppTracker {
     }
 
     /**
-     * Initialize calibration state
+     * Initialize enhanced calibration state with adaptive learning
      */
     private initializeCalibration(): CalibrationState {
         return {
             samplesCollected: 0,
-            requiredSamples: 300,        // 300 samples minimum for calibration
-            networkBaseline: 0,           // Will be calculated from first 100 samples
+            requiredSamples: 500,         // 500 samples for robust calibration
+            networkBaseline: 0,            // Robust baseline using trimmed mean
+            networkVariance: 0,            // Network variance
             isCalibrated: false,
-            calibrationStartedAt: Date.now()
+            calibrationStartedAt: Date.now(),
+            calibrationPhase: 'initial',
+            clusters: new Map<string, RTTCluster>(),
+            clusteringComplete: false,
+            lastRecalibration: Date.now(),
+            recalibrationInterval: 300,    // Recalibrate every 300 samples
+            adaptiveWindow: []
         };
     }
 
@@ -764,31 +902,272 @@ export class WhatsAppTracker {
     }
 
     /**
-     * Calculate network baseline from first 100 RTT samples
+     * Calculate robust network baseline using trimmed mean (removes outliers)
+     * More accurate than simple median - removes top/bottom 10% before averaging
      * @param rttHistory Array of RTT measurements
-     * @returns Network baseline (median of first 100 samples)
+     * @returns Robust baseline RTT
      */
-    private calculateNetworkBaseline(rttHistory: number[]): number {
-        if (rttHistory.length < 100) return 0;
+    private calculateRobustBaseline(rttHistory: number[]): number {
+        if (rttHistory.length < 50) return 0;
 
-        // Take first 100 samples
-        const firstSamples = rttHistory.slice(0, 100);
-        return this.calculateMedian(firstSamples);
+        // Sort the samples
+        const sorted = [...rttHistory].sort((a, b) => a - b);
+
+        // Use trimmed mean: remove top and bottom 10%
+        const trimPercent = 0.10;
+        const trimCount = Math.floor(sorted.length * trimPercent);
+        const trimmed = sorted.slice(trimCount, sorted.length - trimCount);
+
+        // Calculate mean of trimmed data
+        const sum = trimmed.reduce((acc, val) => acc + val, 0);
+        return sum / trimmed.length;
     }
 
     /**
-     * Update adjusted thresholds based on network baseline
-     * @param thresholds StateThresholds object to update
-     * @param networkBaseline Network baseline RTT
+     * Calculate variance of RTT samples for confidence scoring
+     * @param samples Array of RTT measurements
+     * @param mean Mean RTT value
+     * @returns Variance
      */
-    private updateAdjustedThresholds(thresholds: StateThresholds, networkBaseline: number) {
-        // Don't adjust if baseline is unreasonably high (network issues during calibration)
-        const adjustment = networkBaseline > 500 ? 0 : networkBaseline;
+    private calculateVariance(samples: number[], mean: number): number {
+        if (samples.length < 2) return 0;
 
-        thresholds.adjusted.veryActive = thresholds.absolute.veryActive + adjustment;
-        thresholds.adjusted.minimized = thresholds.absolute.minimized + adjustment;
-        thresholds.adjusted.screenOn = thresholds.absolute.screenOn + adjustment;
-        thresholds.adjusted.screenOff = thresholds.absolute.screenOff + adjustment;
+        const squaredDiffs = samples.map(val => Math.pow(val - mean, 2));
+        return squaredDiffs.reduce((acc, val) => acc + val, 0) / samples.length;
+    }
+
+    /**
+     * Perform k-means clustering on RTT data to automatically detect device states
+     * Identifies distinct RTT clusters representing different device states
+     * @param rttHistory Array of all RTT measurements
+     * @param k Number of clusters (typically 3-4: active, minimized, screen-on, screen-off)
+     * @returns Array of cluster centroids
+     */
+    private performKMeansClustering(rttHistory: number[], k: number = 4): RTTCluster[] {
+        if (rttHistory.length < 50) return [];
+
+        // Initialize centroids using quantile-based initialization (better than random)
+        const sorted = [...rttHistory].sort((a, b) => a - b);
+        const centroids: number[] = [];
+        for (let i = 0; i < k; i++) {
+            const quantile = (i + 1) / (k + 1);
+            const index = Math.floor(quantile * sorted.length);
+            centroids.push(sorted[index]);
+        }
+
+        // K-means iteration
+        const maxIterations = 20;
+        let iteration = 0;
+        let converged = false;
+
+        while (iteration < maxIterations && !converged) {
+            // Assignment step: assign each point to nearest centroid
+            const clusters: number[][] = Array.from({ length: k }, () => []);
+
+            for (const rtt of rttHistory) {
+                let nearestCluster = 0;
+                let minDistance = Math.abs(rtt - centroids[0]);
+
+                for (let i = 1; i < k; i++) {
+                    const distance = Math.abs(rtt - centroids[i]);
+                    if (distance < minDistance) {
+                        minDistance = distance;
+                        nearestCluster = i;
+                    }
+                }
+
+                clusters[nearestCluster].push(rtt);
+            }
+
+            // Update step: recalculate centroids
+            const newCentroids: number[] = [];
+            for (let i = 0; i < k; i++) {
+                if (clusters[i].length > 0) {
+                    const mean = clusters[i].reduce((acc, val) => acc + val, 0) / clusters[i].length;
+                    newCentroids.push(mean);
+                } else {
+                    // Keep old centroid if cluster is empty
+                    newCentroids.push(centroids[i]);
+                }
+            }
+
+            // Check convergence (centroids barely changed)
+            converged = true;
+            for (let i = 0; i < k; i++) {
+                if (Math.abs(newCentroids[i] - centroids[i]) > 1) {
+                    converged = false;
+                    break;
+                }
+            }
+
+            centroids.splice(0, k, ...newCentroids);
+            iteration++;
+        }
+
+        // Build cluster objects with statistics
+        const clusterObjects: RTTCluster[] = [];
+
+        // Re-assign points to final clusters
+        const finalClusters: number[][] = Array.from({ length: k }, () => []);
+        for (const rtt of rttHistory) {
+            let nearestCluster = 0;
+            let minDistance = Math.abs(rtt - centroids[0]);
+
+            for (let i = 1; i < k; i++) {
+                const distance = Math.abs(rtt - centroids[i]);
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    nearestCluster = i;
+                }
+            }
+
+            finalClusters[nearestCluster].push(rtt);
+        }
+
+        // Calculate cluster statistics
+        for (let i = 0; i < k; i++) {
+            if (finalClusters[i].length > 0) {
+                const variance = this.calculateVariance(finalClusters[i], centroids[i]);
+                const confidence = Math.min(1.0, finalClusters[i].length / 50); // More samples = higher confidence
+
+                clusterObjects.push({
+                    centroid: centroids[i],
+                    samples: finalClusters[i],
+                    variance: variance,
+                    confidence: confidence
+                });
+            }
+        }
+
+        // Sort clusters by centroid (lowest RTT first)
+        clusterObjects.sort((a, b) => a.centroid - b.centroid);
+
+        return clusterObjects;
+    }
+
+    /**
+     * Update thresholds adaptively based on detected clusters
+     * Uses cluster boundaries instead of fixed absolute values
+     * @param thresholds StateThresholds object to update
+     * @param clusters Detected RTT clusters
+     * @param networkBaseline Network baseline for fallback
+     */
+    private updateAdaptiveThresholds(
+        thresholds: StateThresholds,
+        clusters: RTTCluster[],
+        networkBaseline: number
+    ) {
+        if (clusters.length >= 3) {
+            // Use cluster-based thresholds (boundaries between clusters)
+            // Boundary = midpoint between adjacent cluster centroids
+
+            const cluster0 = clusters[0]; // Lowest RTT cluster (very active)
+            const cluster1 = clusters[1]; // Second cluster (minimized/screen on)
+            const cluster2 = clusters[2]; // Third cluster (screen off)
+
+            // Calculate boundaries with variance-based margins
+            const margin0 = Math.sqrt(cluster0.variance) * 0.5;
+            const margin1 = Math.sqrt(cluster1.variance) * 0.5;
+
+            thresholds.adjusted.veryActive = cluster0.centroid + margin0;
+            thresholds.adjusted.minimized = (cluster0.centroid + cluster1.centroid) / 2;
+            thresholds.adjusted.screenOn = cluster1.centroid + margin1;
+
+            if (clusters.length >= 4) {
+                const cluster3 = clusters[3]; // Fourth cluster (deep standby)
+                thresholds.adjusted.screenOff = (cluster2.centroid + cluster3.centroid) / 2;
+            } else {
+                thresholds.adjusted.screenOff = cluster2.centroid + Math.sqrt(cluster2.variance) * 0.5;
+            }
+
+            trackerLogger.debug(
+                `[ADAPTIVE THRESHOLDS] Cluster-based: ` +
+                `Active: ${thresholds.adjusted.veryActive.toFixed(0)}ms, ` +
+                `Minimized: ${thresholds.adjusted.minimized.toFixed(0)}ms, ` +
+                `ScreenOn: ${thresholds.adjusted.screenOn.toFixed(0)}ms, ` +
+                `ScreenOff: ${thresholds.adjusted.screenOff.toFixed(0)}ms`
+            );
+        } else {
+            // Fallback to baseline-adjusted absolute thresholds
+            const adjustment = networkBaseline > 500 ? 0 : networkBaseline;
+
+            thresholds.adjusted.veryActive = thresholds.absolute.veryActive + adjustment;
+            thresholds.adjusted.minimized = thresholds.absolute.minimized + adjustment;
+            thresholds.adjusted.screenOn = thresholds.absolute.screenOn + adjustment;
+            thresholds.adjusted.screenOff = thresholds.absolute.screenOff + adjustment;
+
+            trackerLogger.debug(
+                `[FALLBACK THRESHOLDS] Baseline-adjusted (${networkBaseline.toFixed(0)}ms): ` +
+                `Active: ${thresholds.adjusted.veryActive.toFixed(0)}ms, ` +
+                `Minimized: ${thresholds.adjusted.minimized.toFixed(0)}ms, ` +
+                `ScreenOn: ${thresholds.adjusted.screenOn.toFixed(0)}ms, ` +
+                `ScreenOff: ${thresholds.adjusted.screenOff.toFixed(0)}ms`
+            );
+        }
+    }
+
+    /**
+     * Perform adaptive recalibration using recent samples
+     * Updates baseline and thresholds based on rolling window
+     * @param metrics Device metrics to recalibrate
+     */
+    private performAdaptiveRecalibration(metrics: DeviceMetrics) {
+        const calibration = metrics.calibration;
+
+        // Check if recalibration is due
+        const samplesSinceLastRecal = calibration.samplesCollected -
+            (calibration.lastRecalibration || 0);
+
+        if (samplesSinceLastRecal < calibration.recalibrationInterval) {
+            return;
+        }
+
+        trackerLogger.debug(
+            `[RECALIBRATION] Starting adaptive recalibration ` +
+            `(${calibration.samplesCollected} samples collected)`
+        );
+
+        // Update adaptive window (last 200 samples)
+        const windowSize = 200;
+        const recentSamples = metrics.rttHistory.slice(-windowSize);
+        calibration.adaptiveWindow = recentSamples;
+
+        // Recalculate baseline from adaptive window
+        const newBaseline = this.calculateRobustBaseline(recentSamples);
+        const oldBaseline = calibration.networkBaseline;
+
+        // Exponential smoothing: blend old and new baseline (70% old, 30% new)
+        calibration.networkBaseline = oldBaseline * 0.7 + newBaseline * 0.3;
+        calibration.networkVariance = this.calculateVariance(
+            recentSamples,
+            calibration.networkBaseline
+        );
+
+        // Re-run clustering on recent data for adaptive threshold updates
+        const recentClusters = this.performKMeansClustering(recentSamples, 4);
+
+        // Update clusters map
+        calibration.clusters.clear();
+        recentClusters.forEach((cluster, index) => {
+            const stateName = ['veryActive', 'minimized', 'screenOn', 'screenOff'][index] || `cluster${index}`;
+            calibration.clusters.set(stateName, cluster);
+        });
+
+        // Update thresholds based on new clusters
+        this.updateAdaptiveThresholds(
+            metrics.thresholds,
+            recentClusters,
+            calibration.networkBaseline
+        );
+
+        calibration.lastRecalibration = calibration.samplesCollected;
+
+        trackerLogger.info(
+            `\n[RECALIBRATION COMPLETE] ` +
+            `Baseline: ${oldBaseline.toFixed(0)}ms -> ${calibration.networkBaseline.toFixed(0)}ms, ` +
+            `Variance: ${Math.sqrt(calibration.networkVariance).toFixed(0)}ms, ` +
+            `Clusters: ${recentClusters.length}\n`
+        );
     }
 
     /**
@@ -936,12 +1315,25 @@ export class WhatsAppTracker {
             }
         }
 
-        // 2. Check calibration state - need 300 samples for reliable classification
+        // 2. Check calibration state - need 500 samples for reliable classification
         if (!metrics.calibration.isCalibrated) {
             const progress = metrics.calibration.samplesCollected;
             const required = metrics.calibration.requiredSamples;
-            metrics.state = `${DeviceState.CALIBRATING} (${progress}/${required})`;
-            trackerLogger.debug(`[DEVICE ${jid}] Still calibrating: ${progress}/${required} samples`);
+            const phase = metrics.calibration.calibrationPhase;
+
+            // Show calibration phase in status
+            const phaseNames: Record<string, string> = {
+                'initial': 'Initializing',
+                'clustering': 'Detecting States',
+                'refinement': 'Refining',
+                'adaptive': 'Adaptive'
+            };
+            const phaseName = phaseNames[phase] || 'Calibrating';
+
+            metrics.state = `${phaseName}... (${progress}/${required})`;
+            trackerLogger.debug(
+                `[DEVICE ${jid}] Calibration Phase: ${phase} - ${progress}/${required} samples`
+            );
             return;
         }
 
@@ -1117,6 +1509,7 @@ export class WhatsAppTracker {
         }
         this.probeTimeouts.clear();
         this.probeStartTimes.clear();
+        this.probeTargets.clear();
 
         logger.info('Stopping tracking');
     }

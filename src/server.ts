@@ -62,9 +62,11 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('QR Code generated');
+            console.log('[WHATSAPP] QR Code generated, length:', qr.length);
+            console.log('[WHATSAPP] QR Code preview:', qr.substring(0, 50) + '...');
             currentWhatsAppQr = qr; // Store the QR code
             io.emit('qr', qr);
+            console.log('[WHATSAPP] QR code emitted to', io.sockets.sockets.size, 'connected client(s)');
         }
 
         if (connection === 'close') {
@@ -227,11 +229,14 @@ checkSignalConnection();
 setInterval(checkSignalConnection, 5000);
 
 io.on('connection', (socket) => {
-    console.log('Client connected');
+    console.log('[SOCKET.IO] Client connected, total clients:', io.sockets.sockets.size);
 
     // Send current WhatsApp QR code if available
     if (currentWhatsAppQr) {
+        console.log('[SOCKET.IO] Sending stored QR code to new client');
         socket.emit('qr', currentWhatsAppQr);
+    } else {
+        console.log('[SOCKET.IO] No QR code available to send');
     }
 
     if (isWhatsAppConnected) {
